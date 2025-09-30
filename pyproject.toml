@@ -9,3 +9,10 @@ dependencies = [
     "pyroute2>=0.9.4",
     "requests>=2.32.5",
 ]
+
+[project.scripts]
+shocker = "main:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
