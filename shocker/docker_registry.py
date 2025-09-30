@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 import requests
 
+ARTIFACTS_DIR = Path("./docker_artifacts")
 
 class DockerRegistryClient:
     """Client for interacting with Docker Registry API v2.
@@ -97,7 +98,7 @@ class DockerRegistryClient:
         return content
 
     def pull(self, output_dir: Path | None = None, download_layers: bool = True, 
-             architecture: str = "amd64", os_type: str = "linux") -> Dict[str, Any]:
+             architecture: str = "amd64", os_type: str = "linux"):
         """
         Pull a complete Docker image by downloading manifest and optionally all layers.
         
@@ -107,19 +108,10 @@ class DockerRegistryClient:
             os_type: Target OS (default: linux)
         """
         if output_dir is None:
-            output_dir = Path(f"./docker_artifacts/{self.repository.replace('/', '_')}_{self.tag}")
+            output_dir = ARTIFACTS_DIR / f"{self.repository.replace('/', '_')}_{self.tag}"
         
         output_dir.mkdir(exist_ok=True)
-        
-        result = {
-            "repository": self.repository,
-            "tag": self.tag,
-            "manifest_list_path": None,
-            "manifest_path": None,
-            "platform_digest": None,
-            "layers": [],
-            "downloaded_layers": []
-        }
+    
         
         # Step 1: Get manifest list
         print("Getting manifest list...")
@@ -136,9 +128,7 @@ class DockerRegistryClient:
         # Step 4: Process layers
         if not manifest.get("layers"):
             raise ValueError("No layers found in manifest")
-        
-        result["layers"] = [layer["digest"] for layer in manifest["layers"]]
-        
+
         if download_layers:
             print(f"Downloading {len(manifest['layers'])} layers...")
             for i, layer in enumerate(manifest["layers"], 1):
@@ -155,18 +145,42 @@ class DockerRegistryClient:
                 layer_filename = f"layer_{i:03d}_{layer_digest.replace(':', '_')}.tar.gz"
                 layer_path = output_dir / layer_filename
                 
+                if layer_path.exists():
+                    print(f"Layer already exists at {layer_path}, skipping download.")
+                    continue
+
                 self._download_blob(layer_digest, layer_path)
-                result["downloaded_layers"].append({
-                    "digest": layer_digest,
-                    "path": layer_path,
-                    "size": layer.get("size", 0)
-                })
                 print(f"Layer saved to {layer_path}")
         
         print(f"\nPull completed!")
         print(f"Repository: {self.repository}:{self.tag}")
         print(f"Platform: {os_type}/{architecture}")
         print(f"Output directory: {output_dir}")
-        print(f"Layers: {len(result['layers'])} total, {len(result['downloaded_layers'])} downloaded")
+        print(f"Layers: {len(manifest['layers'])} total")
+
+    @staticmethod
+    def list() -> list:
+        """List all pulled images."""
+        if not ARTIFACTS_DIR.exists():
+            return []
         
-        return result
+        images = []
+        for item in ARTIFACTS_DIR.iterdir():
+            if item.is_dir():
+                # Extract repo and tag from folder name
+                folder_name = item.name
+                if "_" in folder_name:
+                    parts = folder_name.rsplit("_", 1)
+                    repo = parts[0].replace("_", "/")
+                    tag = parts[1]
+                else:
+                    repo = folder_name
+                    tag = "unknown"
+                
+                images.append({
+                    "repository": repo,
+                    "tag": tag,
+                    "path": item
+                })
+
+        return images
