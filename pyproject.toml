@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.scripts]
-shocker = "main:cli"
+shocker = "shocker.main:cli"
 
 [build-system]
 requires = ["hatchling"]
