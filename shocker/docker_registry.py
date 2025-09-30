@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 import requests
 
-ARTIFACTS_DIR = Path("./docker_artifacts")
+ARTIFACTS_DIR = Path(__file__).parent.parent / "docker_artifacts"
 
 class DockerRegistryClient:
     """Client for interacting with Docker Registry API v2.
@@ -20,6 +20,9 @@ class DockerRegistryClient:
         self.repository = f"library/{repository}"
         self.tag = tag
         self.token = self._get_bearer_token()
+
+        if not ARTIFACTS_DIR.exists():
+            ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
     def _get_bearer_token(self) -> str:
         """Get a bearer token for the specified repository and return it."""
