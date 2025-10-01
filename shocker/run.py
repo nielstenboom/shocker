@@ -5,20 +5,60 @@ import os
 import subprocess
 from pathlib import Path
 from typing import List, Dict, Optional
+from pyroute2 import IPRoute, NetNS, netns
+from pyroute2.netlink.exceptions import NetlinkError
 from shocker.docker_registry import ARTIFACTS_DIR
 
+def setup_network_namespace(netns_name: str) -> str:
+    """
+    Create and configure a network namespace.
+    Returns the namespace name.
+    """
+    try:
+        # Create network namespace
+        netns.create(netns_name)
+        print(f"🌐 Created network namespace: {netns_name}")
+        
+        # Configure container end inside namespace
+        with NetNS(netns_name) as ns:
+            # Set up loopback
+            lo_idx = ns.link_lookup(ifname='lo')[0]
+            ns.link('set', index=lo_idx, state='up')
+        
+        print(f"🔗 Network namespace configured with loopback only")
+        return netns_name
+        
+    except Exception as e:
+        print(f"❌ Failed to setup network namespace: {e}")
+        # Cleanup on failure
+        cleanup_network_namespace(netns_name)
+        raise
+
+def cleanup_network_namespace(netns_name: str):
+    """Clean up network namespace and associated resources."""
+    try:
+        # Remove namespace
+        try:
+            netns.remove(netns_name)
+            print(f"🧹 Cleaned up network namespace: {netns_name}")
+        except:
+            pass
+            
+    except Exception as e:
+        print(f"⚠️  Error during network cleanup: {e}")
+
 def chroot_execute(root_path: Path, command: List[str], 
-                   env_vars: Dict[str, str] | None = None, interactive: bool = False) -> subprocess.CompletedProcess | None:
+                   env_vars: Dict[str, str] | None = None, 
+                   netns_name: str | None = None) -> subprocess.CompletedProcess | None:
     """
     Execute a command in a chroot environment using system chroot command.
     
     Args:
         root_path: Path to the new root directory
         command: Command to execute as list
-        working_dir: Working directory inside chroot (default: "/")
         env_vars: Environment variables dict (optional)
         interactive: Whether to run interactively
-        tty: Whether to allocate a TTY
+        netns_name: Network namespace to run in (optional)
     """
     # Build environment
     env = os.environ.copy()
@@ -34,7 +74,8 @@ def chroot_execute(root_path: Path, command: List[str],
         "TERM": "xterm"
     })
     
-    chroot_cmd = ["chroot", str(root_path)] + command
+
+    chroot_cmd = ["ip", "netns", "exec", netns_name, "chroot", str(root_path)] + command
     
     print(f"🔧 Executing: {' '.join(chroot_cmd)}")
     
@@ -68,6 +109,9 @@ def run_container(repository: str, tag: str, command: List[str], tty: bool = Fal
     
     print(f"Created temporary container filesystem at: {rootfs_path}")
     
+    netns_name = f"shocker-{temp_dir.name}"
+    setup_network_namespace(netns_name)
+    
     try:
         # Extract all layers in order
         for i, layer_file in enumerate(layer_files, 1):
@@ -85,15 +129,21 @@ def run_container(repository: str, tag: str, command: List[str], tty: bool = Fal
         
         # Execute the command in chroot
         print(f"\n🚀 Running command: {' '.join(command)}")
+        print(f"🌐 Running in isolated network namespace: {netns_name}")
+
         result = chroot_execute(
             root_path=rootfs_path,
             command=command,
+            netns_name=netns_name
         )
         
         if result and hasattr(result, 'returncode'):
             print(f"\n✅ Command completed with exit code: {result.returncode}")
             
     finally:
+
+        cleanup_network_namespace(netns_name)
+        
         # Clean up temporary directory
         print(f"\n🧹 Cleaning up temporary directory: {temp_dir}")
         shutil.rmtree(temp_dir)
