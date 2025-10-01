@@ -180,10 +180,20 @@ class DockerRegistryClient:
                     repo = folder_name
                     tag = "unknown"
                 
+                # Calculate total size of all files in the directory
+                total_size = 0
+                for file_path in item.rglob("*"):
+                    if file_path.is_file():
+                        total_size += file_path.stat().st_size
+                
+                # Convert to MB
+                size_mb = total_size / (1024 * 1024)
+                
                 images.append({
                     "repository": repo,
                     "tag": tag,
-                    "path": item
+                    "path": item,
+                    "size_mb": round(size_mb, 2)
                 })
 
         return images

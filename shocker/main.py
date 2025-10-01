@@ -37,27 +37,34 @@ def list():
         return
     
     click.echo("\nPulled Images:")
-    click.echo("-" * 50)
+    click.echo("-" * 70)
     for img in images:
-        click.echo(f"{img['repository']}:{img['tag']}")
+        click.echo(f"{img['repository']}:{img['tag']} ({img['size_mb']} MB)")
         click.echo(f"  Path: {img['path']}")
         click.echo()
 
 @cli.command()
 @click.argument('image')
 @click.argument('command', nargs=-1)
-def run(image, command):
-    """Run a command in a container."""
+@click.option('-p', '--port', multiple=True, help='Port forwarding (host:container)')
+def run(image, command, port):
+    """Run a container with optional port forwarding."""
     if ':' in image:
         repository, tag = image.split(':', 1)
     else:
         repository, tag = image, 'latest'
     
-    cmd = list(command) if command else ['/bin/sh']
+    # Parse port forwarding
+    port_mappings = []
+    for p in port:
+        if ':' in p:
+            host_port, container_port = p.split(':', 1)
+            port_mappings.append((int(host_port), int(container_port)))
+        else:
+            port_mappings.append((int(p), int(p)))  # Same port on both sides
 
-    click.echo(f"🚀 Running {repository}:{tag} with command: {' '.join(cmd)}")
-    
-    run_container(repository, tag, cmd)
+    run_container(repository, tag, command, port_mappings=port_mappings)
+
 
 if __name__ == "__main__":
     cli()
