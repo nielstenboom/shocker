@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import List, Dict, Optional
 
 from shocker.docker_registry import ARTIFACTS_DIR
-from shocker.networking import BRIDGE_NAME, CONTAINER_IP, cleanup_network_namespace, setup_dns, setup_network_namespace, setup_port_forwarding
+from shocker.networking import BRIDGE_NAME, cleanup_network_namespace, setup_dns, setup_network_namespace, setup_port_forwarding, cleanup_port_forwarding
+from shocker.container_registry import ContainerRegistry
 
 def chroot_execute(root_path: Path, command: List[str], 
                    env_vars: Dict[str, str] | None = None, 
@@ -47,7 +48,8 @@ def chroot_execute(root_path: Path, command: List[str],
 
 
 def run_container(repository: str, tag: str, command: List[str], 
-                  tty: bool = False, port_mappings: List[tuple[int, int]] = None):
+                  tty: bool = False, port_mappings: List[tuple[int, int]] = None,
+                  container_name: str = None):
     """Run a container from pulled image layers."""
     if port_mappings is None:
         port_mappings = []
@@ -74,12 +76,18 @@ def run_container(repository: str, tag: str, command: List[str],
     
     print(f"Created temporary container filesystem at: {rootfs_path}")
     
+    # Allocate IP from registry and setup network
+    container_ip = ContainerRegistry.allocate_ip()
     netns_name = f"shocker-{temp_dir.name}"
-    setup_network_namespace(netns_name)
+    setup_network_namespace(netns_name, container_ip)
+    
+    # Register container if named
+    if container_name:
+        ContainerRegistry.register(container_name, container_ip, netns_name)
+        print(f"📝 Registered container '{container_name}' with IP {container_ip}")
     
     if port_mappings:
-        setup_port_forwarding(port_mappings)
-        # socat_processes = setup_port_forwarding_socat(port_mappings)
+        setup_port_forwarding(port_mappings, container_ip)
     
     try:
         # Extract all layers in order
@@ -87,18 +95,16 @@ def run_container(repository: str, tag: str, command: List[str],
             print(f"[{i}/{len(layer_files)}] Extracting {layer_file.name}...")
 
             with tarfile.open(layer_file, 'r:gz') as tar:
-                # Extract to rootfs, allowing overwrites (later layers override earlier ones)
                 tar.extractall(path=rootfs_path)
         
         print(f"✅ Container filesystem ready at: {rootfs_path}")
-        print(f"📁 Contents: {list(rootfs_path.iterdir())[:10]}{'...' if len(list(rootfs_path.iterdir())) > 10 else ''}")
         
-        # Setup DNS for internet access
-        setup_dns(rootfs_path)
+        # Setup DNS and hosts file (includes all registered containers)
+        setup_dns(rootfs_path, container_name)
         
         # Execute the command in chroot
         print(f"\n🚀 Running command: {' '.join(command)}")
-        print(f"🌐 Container IP: {CONTAINER_IP} (connected to bridge {BRIDGE_NAME})")
+        print(f"🌐 Container IP: {container_ip} (connected to bridge {BRIDGE_NAME})")
 
         result = chroot_execute(
             root_path=rootfs_path,
@@ -110,6 +116,15 @@ def run_container(repository: str, tag: str, command: List[str],
             print(f"\n✅ Command completed with exit code: {result.returncode}")
             
     finally:
+        # Cleanup port forwarding
+        if port_mappings:
+            cleanup_port_forwarding(port_mappings, container_ip)
+        
+        # Unregister container if named
+        if container_name:
+            ContainerRegistry.unregister(container_name)
+            print(f"🗑️  Unregistered container '{container_name}'")
+        
         cleanup_network_namespace(netns_name)
         
         # Clean up temporary directory
