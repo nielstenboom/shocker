@@ -8,7 +8,6 @@ from pyroute2.netlink.exceptions import NetlinkError
 # Simple bridge configuration
 BRIDGE_NAME = "shocker0"
 BRIDGE_IP = "69.69.0.1"
-CONTAINER_IP = "69.69.0.2"
 
 def ensure_bridge_exists():
     """Create and configure the shocker bridge if it doesn't exist."""
@@ -18,6 +17,7 @@ def ensure_bridge_exists():
             try:
                 bridge_idx = ipr.link_lookup(ifname=BRIDGE_NAME)[0]
                 print(f"🌉 Bridge {BRIDGE_NAME} already exists")
+                enable_bridge_forwarding()  # Add this line
                 return
             except IndexError:
                 pass  # Bridge doesn't exist, create it
@@ -30,13 +30,15 @@ def ensure_bridge_exists():
             ipr.addr('add', index=bridge_idx, address=BRIDGE_IP, prefixlen=24)
             ipr.link('set', index=bridge_idx, state='up')
             
+            enable_bridge_forwarding()  # Add this line too
+            
             print(f"🌉 Created bridge {BRIDGE_NAME} at {BRIDGE_IP}/24")
             
     except Exception as e:
         print(f"❌ Failed to create bridge: {e}")
         raise
 
-def setup_network_namespace(netns_name: str) -> str:
+def setup_network_namespace(netns_name: str, container_ip: str) -> str:
     """
     Create and configure a network namespace with bridge connection.
     Returns the namespace name.
@@ -49,27 +51,41 @@ def setup_network_namespace(netns_name: str) -> str:
         netns.create(netns_name)
         print(f"🌐 Created network namespace: {netns_name}")
         
-        # Create veth pair
-        veth_host = "veth-host"
+        # Create veth pair with unique names
+        veth_host = f"veth-{netns_name[-8:]}"  # Use last 8 chars of netns name
         veth_container = "eth0"  # Standard container interface name
         
         with IPRoute() as ipr:
             # Create veth pair
             ipr.link('add', ifname=veth_host, peer=veth_container, kind='veth')
             
-            # Move container end to namespace
+            # Get the container end's interface index before moving it
             container_idx = ipr.link_lookup(ifname=veth_container)[0]
+            
+            # Generate a unique MAC address based on the container IP
+            # Format: 02:42:AC:XX:XX:XX (Docker-style, locally administered)
+            ip_parts = container_ip.split('.')
+            mac_address = f"02:42:45:{int(ip_parts[2]):02x}:{int(ip_parts[3]):02x}:00"
+            
+            # Set MAC address before moving to namespace
+            ipr.link('set', index=container_idx, address=mac_address)
+            
+            # Move container end to namespace
             ipr.link('set', index=container_idx, net_ns_fd=netns_name)
             
-            # Connect host end to bridge (instead of direct IP assignment)
+            # Connect host end to bridge
             bridge_idx = ipr.link_lookup(ifname=BRIDGE_NAME)[0]
             veth_host_idx = ipr.link_lookup(ifname=veth_host)[0]
             ipr.link('set', index=veth_host_idx, master=bridge_idx, state='up')
+            
+            # Enable hairpin mode and learning on the veth
+            subprocess.run(['bridge', 'link', 'set', 'dev', veth_host, 'hairpin', 'on'], check=False)
+            subprocess.run(['bridge', 'link', 'set', 'dev', veth_host, 'learning', 'on'], check=False)
         
-        # Configure container end inside namespace
+        # Configure container end inside namespace with dynamic IP
         with NetNS(netns_name) as ns:
             container_idx = ns.link_lookup(ifname=veth_container)[0]
-            ns.addr('add', index=container_idx, address=CONTAINER_IP, prefixlen=24)
+            ns.addr('add', index=container_idx, address=container_ip, prefixlen=24)
             ns.link('set', index=container_idx, state='up')
             
             # Set up loopback
@@ -79,7 +95,13 @@ def setup_network_namespace(netns_name: str) -> str:
             # Add default route via bridge
             ns.route('add', dst='default', gateway=BRIDGE_IP)
         
-        print(f"🔗 Container connected to bridge: {CONTAINER_IP} → {BRIDGE_NAME}")
+        # Send gratuitous ARP to populate bridge fdb
+        subprocess.run([
+            'ip', 'netns', 'exec', netns_name,
+            'ping', '-c', '1', '-W', '1', BRIDGE_IP
+        ], check=False, capture_output=True)
+        
+        print(f"🔗 Container connected to bridge: {container_ip} → {BRIDGE_NAME}")
         return netns_name
         
     except Exception as e:
@@ -90,10 +112,11 @@ def setup_network_namespace(netns_name: str) -> str:
 def cleanup_network_namespace(netns_name: str):
     """Clean up network namespace and associated resources."""
     try:
-        # Remove veth interface (removes both ends and disconnects from bridge)
+        # Remove veth interface with unique name
+        veth_host = f"veth-{netns_name[-8:]}"
         try:
             with IPRoute() as ipr:
-                host_idx = ipr.link_lookup(ifname="veth-host")
+                host_idx = ipr.link_lookup(ifname=veth_host)
                 if host_idx:
                     ipr.link('del', index=host_idx[0])
         except:
@@ -110,10 +133,13 @@ def cleanup_network_namespace(netns_name: str):
         print(f"⚠️  Error during network cleanup: {e}")
 
 
-def setup_dns(root_path):
-    """Copy host DNS config to container"""
+def setup_dns(root_path, container_name: str = None):
+    """Setup DNS and hosts file for container."""
+    from shocker.container_registry import ContainerRegistry
+    
     host_resolv = Path("/etc/resolv.conf")
     container_resolv = root_path / "etc" / "resolv.conf"
+    container_hosts = root_path / "etc" / "hosts"
     
     # Ensure etc directory exists
     container_resolv.parent.mkdir(parents=True, exist_ok=True)
@@ -121,13 +147,34 @@ def setup_dns(root_path):
     # Copy DNS configuration
     if host_resolv.exists():
         shutil.copy2(host_resolv, container_resolv)
-        print(f"📡 Copied DNS configuration to container")
+    
+    # Build hosts file with standard entries + all containers
+    hosts_content = [
+        "127.0.0.1\tlocalhost",
+        "::1\t\tlocalhost ip6-localhost ip6-loopback",
+        "fe00::0\t\tip6-localnet",
+        "ff00::0\t\tip6-mcastprefix",
+        "ff02::1\t\tip6-allnodes",
+        "ff02::2\t\tip6-allrouters",
+        "",
+        "# Container hostnames",
+    ]
+    
+    # Add all registered containers
+    container_entries = ContainerRegistry.get_hosts_entries()
+    if container_entries:
+        hosts_content.append(container_entries)
+    
+    container_hosts.write_text("\n".join(hosts_content) + "\n")
+    
+    print(f"📡 Configured DNS and hosts for container")
+    if container_entries:
+        print(f"   Added {len(ContainerRegistry.list_all())} container hostname(s)")
 
-def setup_port_forwarding(port_mappings: List[tuple[int, int]]):
+def setup_port_forwarding(port_mappings: List[tuple[int, int]], container_ip: str):
     """Set up port forwarding using iptables for localhost access."""
     
     # Enable route_localnet to allow DNAT from localhost to work properly
-    # This allows the loopback interface to route to non-local addresses
     subprocess.run([
         'sysctl', '-w', 'net.ipv4.conf.lo.route_localnet=1'
     ], check=False)
@@ -137,16 +184,17 @@ def setup_port_forwarding(port_mappings: List[tuple[int, int]]):
     ], check=False)
     
     for host_port, container_port in port_mappings:
-        # FORWARD rules first
+        # FORWARD rules - insert AFTER the bridge rules (position 3 or higher)
+        # Find the position after bridge rules
         subprocess.run([
-            "iptables", "-I", "FORWARD", "1",
-            "-d", CONTAINER_IP, "-p", "tcp", "--dport", str(container_port),
+            "iptables", "-A", "FORWARD",  # Changed from -I to -A (append)
+            "-d", container_ip, "-p", "tcp", "--dport", str(container_port),
             "-j", "ACCEPT"
         ], check=True)
         
         subprocess.run([
-            "iptables", "-I", "FORWARD", "1", 
-            "-s", CONTAINER_IP, "-p", "tcp", "--sport", str(container_port),
+            "iptables", "-A", "FORWARD",  # Changed from -I to -A (append)
+            "-s", container_ip, "-p", "tcp", "--sport", str(container_port),
             "-j", "ACCEPT"
         ], check=True)
         
@@ -154,96 +202,93 @@ def setup_port_forwarding(port_mappings: List[tuple[int, int]]):
         subprocess.run([
             "iptables", "-t", "nat", "-A", "PREROUTING",
             "-p", "tcp", "--dport", str(host_port),
-            "-j", "DNAT", "--to-destination", f"{CONTAINER_IP}:{container_port}"
+            "-j", "DNAT", "--to-destination", f"{container_ip}:{container_port}"
         ], check=True)
         
         subprocess.run([
             "iptables", "-t", "nat", "-A", "OUTPUT",
             "-p", "tcp", "-d", "127.0.0.1", "--dport", str(host_port),
-            "-j", "DNAT", "--to-destination", f"{CONTAINER_IP}:{container_port}"
+            "-j", "DNAT", "--to-destination", f"{container_ip}:{container_port}"
         ], check=True)
         
-        # MASQUERADE rule - remove -o restriction since DNATed packets aren't routing through bridge properly
+        # MASQUERADE rule
         subprocess.run([
             "iptables", "-t", "nat", "-A", "POSTROUTING",
-            "-p", "tcp", "-d", CONTAINER_IP, "--dport", str(container_port),
+            "-p", "tcp", "-d", container_ip, "--dport", str(container_port),
             "-j", "MASQUERADE"
         ], check=True)
         
-        print(f"🔌 iptables port forwarding: localhost:{host_port} → container:{container_port}")
+        print(f"🔌 Port forwarding: localhost:{host_port} → {container_ip}:{container_port}")
             
 
-def cleanup_port_forwarding(port_mappings: List[tuple[int, int]]):
+def cleanup_port_forwarding(port_mappings: List[tuple[int, int]], container_ip: str):
     """Clean up iptables port forwarding rules."""
     for host_port, container_port in port_mappings:
-        # Clean up NAT rules - match exactly what we created
+        # Clean up NAT rules
         subprocess.run([
             'iptables', '-t', 'nat', '-D', 'PREROUTING',
             '-p', 'tcp', '--dport', str(host_port),
-            '-j', 'DNAT', '--to-destination', f'{CONTAINER_IP}:{container_port}'
+            '-j', 'DNAT', '--to-destination', f'{container_ip}:{container_port}'
         ], check=False)
         
         subprocess.run([
             'iptables', '-t', 'nat', '-D', 'OUTPUT',
             '-p', 'tcp', '-d', '127.0.0.1', '--dport', str(host_port),
-            '-j', 'DNAT', '--to-destination', f'{CONTAINER_IP}:{container_port}'
+            '-j', 'DNAT', '--to-destination', f'{container_ip}:{container_port}'
         ], check=False)
         
         subprocess.run([
             'iptables', '-t', 'nat', '-D', 'POSTROUTING',
-            '-p', 'tcp', '-d', CONTAINER_IP, '--dport', str(container_port),
+            '-p', 'tcp', '-d', container_ip, '--dport', str(container_port),
             '-j', 'MASQUERADE'
         ], check=False)
         
-        # Clean up FORWARD rules - match exactly what we created
+        # Clean up FORWARD rules
         subprocess.run([
             'iptables', '-D', 'FORWARD',
-            '-s', CONTAINER_IP, '-p', 'tcp', '--sport', str(container_port),
+            '-s', container_ip, '-p', 'tcp', '--sport', str(container_port),
             '-j', 'ACCEPT'
         ], check=False)
         
         subprocess.run([
             'iptables', '-D', 'FORWARD',
-            '-d', CONTAINER_IP, '-p', 'tcp', '--dport', str(container_port),
+            '-d', container_ip, '-p', 'tcp', '--dport', str(container_port),
             '-j', 'ACCEPT'
         ], check=False)
     
     print("🧹 Cleaned up iptables rules")
 
-
-def setup_port_forwarding_socat(port_mappings: List[tuple[int, int]]) -> List[subprocess.Popen]:
-    """Set up port forwarding using socat (simpler than iptables)."""
-    socat_processes = []
+def enable_bridge_forwarding():
+    """Enable IP forwarding and configure iptables for container networking."""
+    # Enable IP forwarding
+    subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=1'], check=False)
     
-    for host_port, container_port in port_mappings:
-        try:
-            # Start socat process to forward traffic
-            socat_cmd = [
-                'socat', 
-                f'TCP-LISTEN:{host_port},fork,reuseaddr',
-                f'TCP:{CONTAINER_IP}:{container_port}'
-            ]
-            
-            process = subprocess.Popen(socat_cmd)
-            socat_processes.append(process)
-            
-            print(f"🔌 socat port forwarding: localhost:{host_port} → container:{container_port}")
-            
-        except Exception as e:
-            print(f"⚠️  Failed to setup socat forwarding: {e}")
+    # Check and add bridge forwarding rule for traffic on the bridge subnet
+    check_rule = subprocess.run([
+        'iptables', '-C', 'FORWARD',
+        '-s', '69.69.0.0/24', '-d', '69.69.0.0/24',
+        '-j', 'ACCEPT'
+    ], capture_output=True)
     
-    return socat_processes
-
-def cleanup_port_forwarding_socat(socat_processes: List[subprocess.Popen]):
-    """Clean up socat processes."""
-    for process in socat_processes:
-        try:
-            process.terminate()
-            process.wait(timeout=5)
-        except:
-            try:
-                process.kill()
-                process.wait()
-            except:
-                pass
-    print("🧹 Cleaned up socat processes")
+    if check_rule.returncode != 0:
+        subprocess.run([
+            'iptables', '-I', 'FORWARD', '1',
+            '-s', '69.69.0.0/24', '-d', '69.69.0.0/24',
+            '-j', 'ACCEPT'
+        ], check=True)
+    
+    # Check and add established connections rule
+    check_established = subprocess.run([
+        'iptables', '-C', 'FORWARD',
+        '-m', 'state', '--state', 'RELATED,ESTABLISHED',
+        '-j', 'ACCEPT'
+    ], capture_output=True)
+    
+    if check_established.returncode != 0:
+        subprocess.run([
+            'iptables', '-I', 'FORWARD', '2',
+            '-m', 'state', '--state', 'RELATED,ESTABLISHED',
+            '-j', 'ACCEPT'
+        ], check=True)
+    
+    print(f"🔀 Enabled forwarding for {BRIDGE_NAME}")

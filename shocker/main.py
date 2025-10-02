@@ -47,8 +47,9 @@ def list():
 @click.argument('image')
 @click.argument('command', nargs=-1)
 @click.option('-p', '--port', multiple=True, help='Port forwarding (host:container)')
-def run(image, command, port):
-    """Run a container with optional port forwarding."""
+@click.option('--name', help='Container name for DNS resolution')
+def run(image, command, port, name):
+    """Run a container with optional port forwarding and name."""
     if ':' in image:
         repository, tag = image.split(':', 1)
     else:
@@ -61,9 +62,11 @@ def run(image, command, port):
             host_port, container_port = p.split(':', 1)
             port_mappings.append((int(host_port), int(container_port)))
         else:
-            port_mappings.append((int(p), int(p)))  # Same port on both sides
+            port_mappings.append((int(p), int(p)))
 
-    run_container(repository, tag, command, port_mappings=port_mappings)
+    run_container(repository, tag, command, 
+                  port_mappings=port_mappings,
+                  container_name=name)
 
 
 if __name__ == "__main__":
