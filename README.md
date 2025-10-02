@@ -1,41 +1,22 @@
-Run python webserver port 8000:
+# 🐳 Shocker 
 
-```
-python3 -m http.server 8000
-python3 -m http.server 8000 > /dev/null 2>&1 &
+My shockingly bad docker implementation in Python. Hackathon project to lean about what happens under the hood with docker!
 
-```
-
-## debugging
+## 🚀 Quick Start
 
 ```bash
-# Reset all iptables counters to zero for clean testing
-sudo iptables -t nat -Z
-sudo iptables -Z
+# Install
+uv sync
 
-# Show current state (should be all zeros)
-echo "=== BEFORE CURL - NAT TABLE ==="
-sudo iptables -t nat -L -v -n --line-numbers
+# Pull an image
+sudo .venv/bin/python shocker/main.py pull python:latest
 
-echo "=== BEFORE CURL - FORWARD CHAIN ==="
-sudo iptables -L FORWARD -v -n --line-numbers
+# list images
+sudo .venv/bin/python shocker/main.py list
 
+# Run a container with port forwarding
+sudo .venv/bin/python shocker/main.py run -p 8000 python:latest -- python3 -m http.server 8000
+
+# Access it
 curl localhost:8000
-
-# Check which rules were hit
-echo "=== AFTER CURL - NAT TABLE ==="
-sudo iptables -t nat -L -v -n --line-numbers
-
-echo "=== AFTER CURL - FORWARD CHAIN ==="
-sudo iptables -L FORWARD -v -n --line-numbers
-
-
-curl 69.69.0.2:8000
-
-echo "=== AFTER DIRECT CURL - NAT TABLE ==="
-sudo iptables -t nat -L -v -n --line-numbers
-
-echo "=== AFTER DIRECT CURL - FORWARD CHAIN ==="
-sudo iptables -L FORWARD -v -n --line-numbers
-
 ```
